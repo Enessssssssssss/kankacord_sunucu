@@ -1,37 +1,34 @@
 import asyncio
 import websockets
+import os
+import json
 
-# Bağlı olan tüm arkadaşların listesi
+# Bağlı olan tüm cihazları tutan küme
 clients = set()
 
 async def handle_connection(websocket):
-    # Yeni biri bağlandığında listeye ekle
     clients.add(websocket)
-    print("Yeni bir arkadaş bağlandı!")
+    print(f"Yeni cihaz bağlandı. Toplam: {len(clients)}")
     
     try:
         async for message in websocket:
-            print(f"Mesaj geldi: {message}")
-            # Gelen mesajı, bağlı olan HERKESE gönder (Broadcast)
+            # Gelen JSON paketini doğrula ve herkese (broadcast) gönder
+            # Mesaj zaten JSON formatında geldiği için direkt iletiyoruz
             if clients:
-                # asyncio.wait ile tüm arkadaşlarına aynı anda yolla
-                await asyncio.wait([client.send(message) for client in clients])
-    except:
+                # Gönderen dahil herkese mesajı fırlat
+                await asyncio.gather(*[client.send(message) for client in clients])
+    except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        # Bağlantı koptuğunda listeden sil
         clients.remove(websocket)
-        print("Bir arkadaş ayrıldı.")
+        print(f"Cihaz ayrıldı. Kalan: {len(clients)}")
 
 async def main():
-    # Render'ın bize verdiği portu kullanacağız (Varsayılan 10000)
-    import os
+    # Render'ın portunu yakala
     port = int(os.environ.get("PORT", 10000))
-    
-    # Sunucuyu tüm iplere (0.0.0.0) açıyoruz
     async with websockets.serve(handle_connection, "0.0.0.0", port):
-        print(f"Kankacord Sunucusu {port} portunda çalışıyor...")
-        await asyncio.Future()  # Sunucunun sürekli açık kalmasını sağlar
+        print(f"Kankacord Merkezi {port} portunda tetikte!")
+        await asyncio.Future()  # Sonsuz döngü
 
 if __name__ == "__main__":
     asyncio.run(main())
