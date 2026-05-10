@@ -3,48 +3,48 @@ import websockets
 import os
 import json
 
-# Bağlı kullanıcıları tut: {websocket: username}
+# {websocket: username} eşleşmesi
 clients = {}
 
-async def broadcast_users():
+async def broadcast_user_list():
     if clients:
-        user_list = list(clients.values())
-        data = json.dumps({"type": "users", "list": user_list})
+        # Boş olmayan kullanıcı isimlerini topla
+        names = [n for n in clients.values() if n and n != "Bilinmeyen"]
+        data = json.dumps({"type": "users", "list": names})
+        # Bağlı olan herkese güncel listeyi gönder
         await asyncio.gather(*[ws.send(data) for ws in clients])
 
-async def handle_connection(websocket):
+async def handle(websocket):
     clients[websocket] = "Bilinmeyen"
     try:
         async for message in websocket:
             data = json.loads(message)
-            user = data.get("u")
-            msg_type = data.get("type", "msg")
+            u = data.get("u", "Bilinmeyen")
             
-            if msg_type == "hello":
-                clients[websocket] = user
-                await broadcast_users()
+            if data.get("type") == "hello":
+                clients[websocket] = u
+                await broadcast_user_list()
             else:
-                to_user = data.get("to", "all")
-                if to_user == "all":
-                    # Herkese gönder
+                to = data.get("to", "all")
+                if to == "all":
+                    # Genel Mesaj: Herkese yayınla
                     await asyncio.gather(*[ws.send(message) for ws in clients])
                 else:
-                    # Sadece alıcıya ve gönderene gönder
+                    # Özel Mesaj: Sadece gönderene ve alıcıya ilet
                     for ws, name in clients.items():
-                        if name == to_user or name == user:
+                        if name == to or name == u:
                             await ws.send(message)
-                            
     except:
         pass
     finally:
         if websocket in clients:
             del clients[websocket]
-            await broadcast_users()
+            await broadcast_user_list()
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
-    async with websockets.serve(handle_connection, "0.0.0.0", port):
+    async with websockets.serve(handle, "0.0.0.0", port):
         await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
