@@ -3,32 +3,48 @@ import websockets
 import os
 import json
 
-# Bağlı olan tüm cihazları tutan küme
-clients = set()
+# Bağlı kullanıcıları tut: {websocket: username}
+clients = {}
+
+async def broadcast_users():
+    if clients:
+        user_list = list(clients.values())
+        data = json.dumps({"type": "users", "list": user_list})
+        await asyncio.gather(*[ws.send(data) for ws in clients])
 
 async def handle_connection(websocket):
-    clients.add(websocket)
-    print(f"Yeni cihaz bağlandı. Toplam: {len(clients)}")
-    
+    clients[websocket] = "Bilinmeyen"
     try:
         async for message in websocket:
-            # Gelen JSON paketini doğrula ve herkese (broadcast) gönder
-            # Mesaj zaten JSON formatında geldiği için direkt iletiyoruz
-            if clients:
-                # Gönderen dahil herkese mesajı fırlat
-                await asyncio.gather(*[client.send(message) for client in clients])
-    except websockets.exceptions.ConnectionClosed:
+            data = json.loads(message)
+            user = data.get("u")
+            msg_type = data.get("type", "msg")
+            
+            if msg_type == "hello":
+                clients[websocket] = user
+                await broadcast_users()
+            else:
+                to_user = data.get("to", "all")
+                if to_user == "all":
+                    # Herkese gönder
+                    await asyncio.gather(*[ws.send(message) for ws in clients])
+                else:
+                    # Sadece alıcıya ve gönderene gönder
+                    for ws, name in clients.items():
+                        if name == to_user or name == user:
+                            await ws.send(message)
+                            
+    except:
         pass
     finally:
-        clients.remove(websocket)
-        print(f"Cihaz ayrıldı. Kalan: {len(clients)}")
+        if websocket in clients:
+            del clients[websocket]
+            await broadcast_users()
 
 async def main():
-    # Render'ın portunu yakala
     port = int(os.environ.get("PORT", 10000))
     async with websockets.serve(handle_connection, "0.0.0.0", port):
-        print(f"Kankacord Merkezi {port} portunda tetikte!")
-        await asyncio.Future()  # Sonsuz döngü
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) 
