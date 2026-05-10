@@ -2,96 +2,76 @@ import asyncio
 import websockets
 import os
 import json
+from supabase import create_client
 
-# Bağlı kullanıcıları ve soketlerini eşleştir: {websocket: username}
-clients = {}
+# --- SUPABASE BAĞLANTISI ---
+SUPABASE_URL = "https://kpspzbtxlefxjfjoihka.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtwc3B6YnR4bGVmeGpmam9paGthIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0MjY1MTMsImV4cCI6MjA5NDAwMjUxM30.AS-uUbX0FGmNgZS4LmuvXmi_ybntc7_CHPyl0c9OP3w"
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+clients = {} # {websocket: user_id}
 
 async def broadcast_user_list():
-    """Bağlı olan tüm kullanıcılara güncel kullanıcı listesini gönderir."""
     if clients:
-        # "Bilinmeyen" olmayan ve boş olmayan kullanıcı isimlerini filtrele
-        user_names = [name for name in clients.values() if name and name != "Bilinmeyen"]
-        user_list_packet = json.dumps({
-            "type": "users",
-            "list": user_names
-        })
-        
-        # Listedeki her bir aktif bağlantıya paketi gönder
-        if clients:
-            await asyncio.gather(
-                *[ws.send(user_list_packet) for ws in clients.keys()],
-                return_exceptions=True
-            )
+        try:
+            response = supabase.table("users").select("id, display_name, is_admin").execute()
+            all_users = response.data
+            online_ids = list(clients.values())
+            data = json.dumps({
+                "type": "users",
+                "all_users": all_users,
+                "online_users": online_ids
+            })
+            if clients:
+                await asyncio.gather(*[ws.send(data) for ws in clients.keys()], return_exceptions=True)
+        except Exception as e:
+            print(f"Liste Hatası: {e}")
 
-async def handle_connection(websocket):
-    """Her yeni bağlantıyı yöneten ana döngü."""
-    # Yeni bağlantıyı geçici olarak "Bilinmeyen" olarak kaydet
+async def handle(websocket):
     clients[websocket] = "Bilinmeyen"
-    print(f" Yeni bir bağlantı sağlandı. Mevcut bağlantı sayısı: {len(clients)}")
-    
     try:
         async for message in websocket:
-            try:
-                data = json.loads(message)
-                user_name = data.get("u", "Bilinmeyen")
-                msg_type = data.get("type", "msg")
-                
-                # 1. KİMLİK BİLDİRİMİ (Hello paketi)
-                if msg_type == "hello":
-                    clients[websocket] = user_name
-                    print(f" Kanka katıldı: {user_name}")
-                    await broadcast_user_list()
-                
-                # 2. MESAJLAŞMA (Genel veya DM)
-                else:
-                    target = data.get("to", "all")
-                    
-                    if target == "all":
-                        # Genel Sohbet: Herkese yayınla
-                        if clients:
-                            await asyncio.gather(
-                                *[ws.send(message) for ws in clients.keys()],
-                                return_exceptions=True
-                            )
-                    else:
-                        # Özel Mesaj (DM): Sadece gönderen ve alıcıya ilet
-                        for ws, name in clients.items():
-                            if name == target or name == user_name:
-                                try:
-                                    await ws.send(message)
-                                except:
-                                    pass
+            data = json.loads(message)
+            msg_type = data.get("type")
+            u_id = data.get("u")
+
+            if msg_type == "hello":
+                clients[websocket] = u_id
+                await broadcast_user_list()
             
-            except json.JSONDecodeError:
-                print("Hatalı JSON paketi alındı.")
+            elif msg_type == "msg":
+                to = data.get("to", "all")
+                # Mesajı Buluta Kaydet
+                supabase.table("messages").insert({
+                    "sender": u_id,
+                    "receiver": to,
+                    "content": data.get("m")
+                }).execute()
                 
-    except websockets.exceptions.ConnectionClosed:
-        print("Bir bağlantı kapandı.")
+                # Mesajı İlet
+                if to == "all":
+                    await asyncio.gather(*[ws.send(message) for ws in clients.keys()], return_exceptions=True)
+                else:
+                    for ws, name in clients.items():
+                        if name == to or name == u_id:
+                            await ws.send(message)
+                            
+            elif msg_type == "register":
+                admin_check = supabase.table("users").select("is_admin").eq("id", u_id).execute()
+                if admin_check.data and admin_check.data[0]["is_admin"]:
+                    supabase.table("users").insert(data.get("new_user")).execute()
+                    await broadcast_user_list()
+
+    except Exception as e: print(f"Hata: {e}")
     finally:
-        # Bağlantı koptuğunda temizlik yap
         if websocket in clients:
-            left_user = clients[websocket]
             del clients[websocket]
-            print(f" {left_user} ayrıldı. Kalan: {len(clients)}")
             await broadcast_user_list()
 
 async def main():
-    # Render'ın atadığı portu kullan, yoksa 10000 portunu aç
     port = int(os.environ.get("PORT", 10000))
-    
-    # ping_interval: Bağlantının canlı kalması için her 20 saniyede bir kontrol et
-    async with websockets.serve(
-        handle_connection, 
-        "0.0.0.0", 
-        port,
-        ping_interval=20,
-        ping_timeout=20
-    ):
-        print(f"--- Kankacord Sunucusu {port} Portunda Tetikte ---")
-        await asyncio.Future()  # Sunucuyu sonsuz döngüde tut
+    async with websockets.serve(handle, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Sunucu kapatılıyor...")
+    asyncio.run(main())
