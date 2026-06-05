@@ -1,69 +1,130 @@
 import asyncio
-import websockets
-import os
 import json
-import httpx # Kütüphane yerine bunu kullanıyoruz
+import os
+import httpx
+import websockets
 
-# --- SUPABASE AYARLARI ---
-URL = "https://kpspzbtxlefxjfjoihka.supabase.co/rest/v1/"
-KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtwc3B6YnR4bGVmeGpmam9paGthIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0MjY1MTMsImV4cCI6MjA5NDAwMjUxM30.AS-uUbX0FGmNgZS4LmuvXmi_ybntc7_CHPyl0c9OP3w"
-
+# ═══════════════════════════════════════════════════════════════════
+# SUPABASE BAĞLANTI AYARLARI (Client ile Birebir Eşleşmeli)
+# ═══════════════════════════════════════════════════════════════════
+# Yeni eklediğimiz 'bio' sütununu da select sorgusuna dahil ettik!
+SUPABASE_URL = "https://kpspzbtxlefxjfjoihka.supabase.co/rest/v1/users?select=id,display_name,bio,is_admin"
+KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+       "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imtwc3B6YnR4bGVmeGpmam9paGthIiwi"
+       "cm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0MjY1MTMsImV4cCI6MjA5NDAwMjUxM30."
+       "AS-uUbX0FGmNgZS4LmuvXmi_ybntc7_CHPyl0c9OP3w")
 HEADERS = {
     "apikey": KEY,
-    "Authorization": f"Bearer {KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=minimal"
+    "Authorization": f"Bearer {KEY}"
 }
 
-clients = {}
+# ── Global Durum Yönetimi ──
+CONNECTED_USERS = {}  # Anlık aktif bağlantılar -> {user_id: websocket_inst}
+
+async def fetch_supabase_users():
+    """Supabase'den en güncel kullanıcı verilerini (biyografiler dahil) çeker."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(SUPABASE_URL, headers=HEADERS)
+            if response.status_code == 200:
+                return response.json()
+    except Exception as e:
+        print(f"[-] Supabase verisi çekilirken hata oluştu: {e}")
+    return []
 
 async def broadcast_user_list():
-    if not clients: return
-    async with httpx.AsyncClient() as client:
-        # Kullanıcı listesini kütüphanesiz çekiyoruz
-        res = await client.get(f"{URL}users?select=id,display_name,is_admin", headers=HEADERS)
-        all_users = res.json()
-        data = json.dumps({
-            "type": "users",
-            "all_users": all_users,
-            "online_users": list(clients.values())
-        })
-        await asyncio.gather(*[ws.send(data) for ws in clients.keys()], return_exceptions=True)
+    """Aktif olan ve olmayan tüm kullanıcıların durumunu herkese anlık duyurur."""
+    if not CONNECTED_USERS:
+        return
+    
+    # Veritabanındaki güncel listeyi (ve yeni Bio'ları) alıyoruz
+    all_users = await fetch_supabase_users()
+    online_users = list(CONNECTED_USERS.keys())
+    
+    payload = json.dumps({
+        "type": "users",
+        "all_users": all_users,
+        "online_users": online_users
+    })
+    
+    # Odadaki herkese dağıt (Broadcast)
+    clients = list(CONNECTED_USERS.values())
+    if clients:
+        await asyncio.gather(*[client.send(payload) for client in clients], return_exceptions=True)
 
-async def handle(websocket):
-    clients[websocket] = "Bilinmeyen"
+async def handle_client(websocket, path):
+    """Her bir kankanın sunucuyla olan anlık ilişkisini yöneten ana fonksiyon."""
+    user_id = None
     try:
-        async for message in websocket:
-            data = json.loads(message); m_type = data.get("type"); u_id = data.get("u")
-            if m_type == "hello":
-                clients[websocket] = u_id
-                await broadcast_user_list()
-            elif m_type == "msg":
-                to = data.get("to", "all")
-                # Mesajı kaydet
-                async with httpx.AsyncClient() as client:
-                    await client.post(f"{URL}messages", headers=HEADERS, json={
-                        "sender": u_id, "receiver": to, "content": data.get("m")
-                    })
-                # Mesajı ilet
-                if to == "all":
-                    await asyncio.gather(*[ws.send(message) for ws in clients.keys()], return_exceptions=True)
+        async for raw_message in websocket:
+            data = json.loads(raw_message)
+            msg_type = data.get("type")
+
+            # 1. KANCA ATMA (Giriş Bildirimi)
+            if msg_type == "hello":
+                user_id = data.get("u")
+                if user_id:
+                    CONNECTED_USERS[user_id] = websocket
+                    print(f"[+] {user_id} Kankacord'a bağlandı.")
+                    await broadcast_user_list()
+
+            # 2. MESAJ TRAFİĞİ (Genel Sohbet veya DM)
+            elif msg_type == "msg":
+                sender = data.get("u")
+                msg_text = data.get("m")
+                target = data.get("to", "all")
+
+                relay_payload = json.dumps({
+                    "type": "msg",
+                    "u": sender,
+                    "m": msg_text,
+                    "to": target
+                })
+
+                if target == "all":
+                    # Genel Sohbet: İstisnasız herkese gönder
+                    clients = list(CONNECTED_USERS.values())
+                    if clients:
+                        await asyncio.gather(*[client.send(relay_payload) for client in clients], return_exceptions=True)
                 else:
-                    for ws, name in clients.items():
-                        if name == to or name == u_id: await ws.send(message)
-            elif m_type == "register":
-                # Admin kontrolü ve kayıt
-                async with httpx.AsyncClient() as client:
-                    check = await client.get(f"{URL}users?id=eq.{u_id}&is_admin=eq.true", headers=HEADERS)
-                    if check.json():
-                        await client.post(f"{URL}users", headers=HEADERS, json=data.get("new_user"))
-                        await broadcast_user_list()
-    except: pass
+                    # Özel Mesaj (DM): Sadece hedef kankaya ve mesajı yazan adama gönder
+                    targets = []
+                    if target in CONNECTED_USERS:
+                        targets.append(CONNECTED_USERS[target])
+                    if sender in CONNECTED_USERS and sender != target:
+                        targets.append(CONNECTED_USERS[sender])
+                    
+                    if targets:
+                        await asyncio.gather(*[t.send(relay_payload) for t in targets], return_exceptions=True)
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
     finally:
-        if websocket in clients: del clients[websocket]; await broadcast_user_list()
+        # Kopma durumunda listeden temizle
+        if user_id in CONNECTED_USERS:
+            del CONNECTED_USERS[user_id]
+            print(f"[-] {user_id} Kankacord'dan ayrıldı.")
+            await broadcast_user_list()
+
+async def periodic_sync():
+    """
+    Kankalar uygulamadan çıkmadan ayarlardan Bio veya İsim değiştirdiğinde,
+    diğer agaların ekranına otomatik yansıması için 10 saniyede bir tetiklenir.
+    """
+    while True:
+        await asyncio.sleep(10)
+        await broadcast_user_list()
 
 async def main():
-    port = int(os.environ.get("PORT", 10000))
-    async with websockets.serve(handle, "0.0.0.0", port): await asyncio.Future()
+    # Render, uygulamaları çalıştırırken otomatik port atar. Bunu os.environ ile yakalamak şarttır.
+    port = int(os.environ.get("PORT", 8765))
+    
+    # Arka plan senkronizasyon görevini başlat
+    asyncio.create_task(periodic_sync())
+    
+    print(f"[*] Kankacord Sunucusu 0.0.0.0:{port} üzerinden ayağa kalkıyor...")
+    async with websockets.serve(handle_client, "0.0.0.0", port):
+        await asyncio.Future()  # Sunucunun sürekli açık kalmasını sağlar
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
