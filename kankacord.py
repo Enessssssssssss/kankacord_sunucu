@@ -2,7 +2,7 @@ import asyncio
 import websockets
 import os
 import json
-import httpx # Kütüphane yerine bunu kullanıyoruz
+import httpx
 
 # --- SUPABASE AYARLARI ---
 URL = "https://kpspzbtxlefxjfjoihka.supabase.co/rest/v1/"
@@ -19,51 +19,86 @@ clients = {}
 
 async def broadcast_user_list():
     if not clients: return
-    async with httpx.AsyncClient() as client:
-        # Kullanıcı listesini kütüphanesiz çekiyoruz
-        res = await client.get(f"{URL}users?select=id,display_name,is_admin", headers=HEADERS)
-        all_users = res.json()
-        data = json.dumps({
-            "type": "users",
-            "all_users": all_users,
-            "online_users": list(clients.values())
-        })
-        await asyncio.gather(*[ws.send(data) for ws in clients.keys()], return_exceptions=True)
+    try:
+        async with httpx.AsyncClient() as client:
+            # 5 saniye timeout sınırı koyarak sunucunun sonsuza kadar askıda kalmasını önlüyoruz
+            res = await client.get(f"{URL}users?select=id,display_name,is_admin", headers=HEADERS, timeout=5.0)
+            all_users = res.json()
+            data = json.dumps({
+                "type": "users",
+                "all_users": all_users,
+                "online_users": list(clients.values())
+            })
+            await asyncio.gather(*[ws.send(data) for ws in clients.keys()], return_exceptions=True)
+    except Exception as e:
+        print(f"[Sistem Hatası] Kullanıcı listesi dağıtılamadı: {e}")
+
+async def save_message_to_db(sender, receiver, content):
+    """Mesajı arka planda Supabase'e kaydeder, ana sohbet akışını bloklamaz."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{URL}messages", headers=HEADERS, json={
+                "sender": sender, "receiver": receiver, "content": content
+            }, timeout=5.0)
+    except Exception as e:
+        print(f"[DB Hatası] Mesaj veritabanına yazılamadı: {e}")
 
 async def handle(websocket):
     clients[websocket] = "Bilinmeyen"
     try:
         async for message in websocket:
-            data = json.loads(message); m_type = data.get("type"); u_id = data.get("u")
+            try:
+                # 1. JSON Çözümleme Kontrolü (Hatalı paket soketi koparmasın)
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+                
+            m_type = data.get("type")
+            u_id = data.get("u")
+            
             if m_type == "hello":
                 clients[websocket] = u_id
                 await broadcast_user_list()
+                
             elif m_type == "msg":
                 to = data.get("to", "all")
-                # Mesajı kaydet
-                async with httpx.AsyncClient() as client:
-                    await client.post(f"{URL}messages", headers=HEADERS, json={
-                        "sender": u_id, "receiver": to, "content": data.get("m")
-                    })
-                # Mesajı ilet
+                content = data.get("m")
+                
+                # ÖNCE MESAJI İLET (Sıfır Gecikme / Real-time)
                 if to == "all":
                     await asyncio.gather(*[ws.send(message) for ws in clients.keys()], return_exceptions=True)
                 else:
-                    for ws, name in clients.items():
-                        if name == to or name == u_id: await ws.send(message)
+                    await asyncio.gather(*[
+                        ws.send(message) for ws, name in clients.items() 
+                        if name == to or name == u_id
+                    ], return_exceptions=True)
+                
+                # SONRA ARKA PLAN GÖREVİ OLARAK DB'YE YAZ (Asenkron)
+                asyncio.create_task(save_message_to_db(u_id, to, content))
+                            
             elif m_type == "register":
-                # Admin kontrolü ve kayıt
-                async with httpx.AsyncClient() as client:
-                    check = await client.get(f"{URL}users?id=eq.{u_id}&is_admin=eq.true", headers=HEADERS)
-                    if check.json():
-                        await client.post(f"{URL}users", headers=HEADERS, json=data.get("new_user"))
-                        await broadcast_user_list()
-    except: pass
+                try:
+                    async with httpx.AsyncClient() as client:
+                        check = await client.get(f"{URL}users?id=eq.{u_id}&is_admin=eq.true", headers=HEADERS, timeout=5.0)
+                        if check.json():
+                            await client.post(f"{URL}users", headers=HEADERS, json=data.get("new_user"), timeout=5.0)
+                            await broadcast_user_list()
+                except Exception as e:
+                    print(f"[Kayıt Hatası] Admin/Kayıt işlemi başarısız: {e}")
+                    
+    except websockets.exceptions.ConnectionClosed:
+        pass # Kullanıcı normal şekilde ayrıldı
+    except Exception as e:
+        print(f"[Bağlantı Hatası] Beklenmedik soket hatası: {e}")
     finally:
-        if websocket in clients: del clients[websocket]; await broadcast_user_list()
+        if websocket in clients:
+            del clients[websocket]
+            await broadcast_user_list()
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
-    async with websockets.serve(handle, "0.0.0.0", port): await asyncio.Future()
+    async with websockets.serve(handle, "0.0.0.0", port): 
+        await asyncio.Future()
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__": 
+    asyncio.run(main())
