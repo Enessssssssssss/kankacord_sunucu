@@ -21,7 +21,6 @@ async def broadcast_user_list():
     if not clients: return
     try:
         async with httpx.AsyncClient() as client:
-            # 5 saniye timeout sınırı koyarak sunucunun sonsuza kadar askıda kalmasını önlüyoruz
             res = await client.get(f"{URL}users?select=id,display_name,is_admin", headers=HEADERS, timeout=5.0)
             all_users = res.json()
             data = json.dumps({
@@ -48,7 +47,6 @@ async def handle(websocket):
     try:
         async for message in websocket:
             try:
-                # 1. JSON Çözümleme Kontrolü (Hatalı paket soketi koparmasın)
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
@@ -56,7 +54,30 @@ async def handle(websocket):
             m_type = data.get("type")
             u_id = data.get("u")
             
-            if m_type == "hello":
+            # --- 1. PING / PONG ENTEGRASYONU ---
+            if m_type == "ping":
+                # Arayüzün 5 saniyelik bombasını imha etmek için anında pong dönüyoruz
+                await websocket.send(json.dumps({"type": "pong"}))
+                continue # DB veya broadcast işlemlerine girmeden döngünün başına dön
+            
+            # --- 2. YAZIYOR... (TYPING) SİNYAL DAĞITIMI ---
+            elif m_type == "typing":
+                to = data.get("to", "all")
+                # Performans için bu paketi DB'ye asla kaydetmiyoruz!
+                # Sadece yazan KİŞİ HARİÇ (ws != websocket) hedefteki kankalara fırlatıyoruz
+                if to == "all":
+                    await asyncio.gather(*[
+                        ws.send(message) for ws in clients.keys() 
+                        if ws != websocket
+                    ], return_exceptions=True)
+                else:
+                    await asyncio.gather(*[
+                        ws.send(message) for ws, name in clients.items() 
+                        if name == to and ws != websocket
+                    ], return_exceptions=True)
+                continue
+                
+            elif m_type == "hello":
                 clients[websocket] = u_id
                 await broadcast_user_list()
                 
@@ -87,7 +108,7 @@ async def handle(websocket):
                     print(f"[Kayıt Hatası] Admin/Kayıt işlemi başarısız: {e}")
                     
     except websockets.exceptions.ConnectionClosed:
-        pass # Kullanıcı normal şekilde ayrıldı
+        pass 
     except Exception as e:
         print(f"[Bağlantı Hatası] Beklenmedik soket hatası: {e}")
     finally:
