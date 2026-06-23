@@ -17,16 +17,27 @@ HEADERS = {
 
 clients = {}
 
+# --- MERKEZİ KONFİGÜRASYON BELLEĞİ ---
+# Sunucu hafızasında adminlerin dinamik ayarlarını saklıyoruz.
+# Varsayılan olarak spam engelleme (rate_limit) 0 saniyedir (koruma kapalı).
+server_config = {
+    "rate_limit": 0
+}
+
 async def broadcast_user_list():
     if not clients: return
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(f"{URL}users?select=id,display_name,is_admin", headers=HEADERS, timeout=5.0)
             all_users = res.json()
+            
+            # Kullanıcı listesi paketine güncel konfigürasyonu da ekliyoruz.
+            # Böylece yeni giriş yapan kanka anında odanın güncel spam sınırını öğrenir.
             data = json.dumps({
                 "type": "users",
                 "all_users": all_users,
-                "online_users": list(clients.values())
+                "online_users": list(clients.values()),
+                "config": server_config
             })
             await asyncio.gather(*[ws.send(data) for ws in clients.keys()], return_exceptions=True)
     except Exception as e:
@@ -56,15 +67,12 @@ async def handle(websocket):
             
             # --- 1. PING / PONG ENTEGRASYONU ---
             if m_type == "ping":
-                # Arayüzün 5 saniyelik bombasını imha etmek için anında pong dönüyoruz
                 await websocket.send(json.dumps({"type": "pong"}))
-                continue # DB veya broadcast işlemlerine girmeden döngünün başına dön
+                continue
             
             # --- 2. YAZIYOR... (TYPING) SİNYAL DAĞITIMI ---
             elif m_type == "typing":
                 to = data.get("to", "all")
-                # Performans için bu paketi DB'ye asla kaydetmiyoruz!
-                # Sadece yazan KİŞİ HARİÇ (ws != websocket) hedefteki kankalara fırlatıyoruz
                 if to == "all":
                     await asyncio.gather(*[
                         ws.send(message) for ws in clients.keys() 
@@ -106,6 +114,30 @@ async def handle(websocket):
                             await broadcast_user_list()
                 except Exception as e:
                     print(f"[Kayıt Hatası] Admin/Kayıt işlemi başarısız: {e}")
+            
+            # --- 3. YENİ ADMİN MERKEZİ KONFİGÜRASYON PAKETİ YAKALAYICI ---
+            elif m_type == "config":
+                try:
+                    # Güvenlik Duvarı: İsteyi gönderen kankanın gerçekten admin olup olmadığını DB'den doğrula
+                    async with httpx.AsyncClient() as client:
+                        check = await client.get(f"{URL}users?id=eq.{u_id}&is_admin=eq.true", headers=HEADERS, timeout=5.0)
+                        
+                        if check.json():
+                            # Kullanıcı admin ise limiti güncelle ve sunucu hafızasına yaz
+                            new_limit = int(data.get("rate_limit", 0))
+                            server_config["rate_limit"] = new_limit
+                            print(f"[Config] Admin ({u_id}) spam limitini güncelledi: {new_limit} saniye.")
+                            
+                            # Odadaki tüm aktif kankaların ekranlarına bu yeni kuralı anında fırlat
+                            config_packet = json.dumps({
+                                "type": "config_update",
+                                "config": server_config
+                            })
+                            await asyncio.gather(*[ws.send(config_packet) for ws in clients.keys()], return_exceptions=True)
+                        else:
+                            print(f"[Güvenlik Uyarısı] Admin olmayan kullanıcı ({u_id}) config değiştirmeyi denedi!")
+                except Exception as e:
+                    print(f"[Config Hatası] Konfigürasyon dağıtılamadı: {e}")
                     
     except websockets.exceptions.ConnectionClosed:
         pass 
